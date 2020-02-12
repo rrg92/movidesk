@@ -88,6 +88,155 @@ if($ResetStorage){
 		return [datetime]::ParseExact($DtString, 'yyyy-MM-ddTHH:mm:ss.fffffff', $null).ToLocalTime()
 	}
 	
+	Function Movidesk_Datetime2StringTime {
+		param($Datetime)
+		
+		return $Datetime.toString("yyyy-MM-ddT00:00:00\z")
+	}
+	
+	<#
+		Build a odata that filters multiple values
+		Value can be a single or aray value!
+	
+			If value is a simple string.
+			In any of cases above, the function will generate following:
+				
+				FieldName eq 'VALUE'
+				
+			Value can contains special string.
+			If value is ^VALUE this will be turned into startsiwth(FieldName, 'VALUE')
+			VALUE$ this will be turned into endswith(FieldName, 'VALUE')
+			You can combine both, for example ^VALUE$ and it will generated "startswith(...) and endswith(...)"
+			
+		If you specify LambdaFieldName, it will turn expression into
+		
+			FieldName(f: f/LambdaFieldName OP)
+			
+		OP depends on value, following rule above!
+		
+		For array value, it will repeat rules above for each array element.
+		By default, it will generate a OR operation between fields.
+		But, you can control this for each element using a '&' in VALUE.
+		If it finds a '&' then it generate a AND for that array element!
+		
+		Examples:
+		
+			-FieldName c -Value A 
+				c eq 'A'
+				
+			-FieldName f1 -Value A  -LambdaFieldName prop1/prop11
+			
+				f1(f: prop1/prop11 eq 'A' )
+				
+			-FieldName c -Value A,B 
+				(c eq 'A') or (c eq 'B')
+				
+			-FieldName c -Value '^A','B$'
+				startswith(c,'A') or endswith(c,'B')
+				
+			-FieldName c -Value '^A$','B'
+				(startswith(c,'A') and endswith(c,'B')) or c eq 'B'
+				
+		
+			-FieldName c -Value A,'&B','&C'
+				(c eq 'A') and (c eq 'B') and (c eq 'C')
+				
+			-FieldName c/any -Value A,'&B','&C' -LambdaFieldName 'propA'
+				c/any(f: f/propA c eq 'A') and c/any(f: f/propA eq 'B') and c/any(f: f/propA eq 'C')
+				
+			-FieldName c/any -Value A,'B','&C' -LambdaFieldName 'propA'
+				c/any(c eq 'A') and c/any(c eq 'B') and c/any(c eq 'C')
+				
+			-FieldName c/all -Value '^A$','B' LambdaFieldName 'x/y'
+				c/all(f: (startswith(f/x/y,'A') and endswith(f/x/y,'B'))) or c/all(f: f/x/y eq 'B' ) 
+	#>
+	Function Movidesk_BuildExpressionFilter {
+		param(
+			$FieldName
+			,$Value
+			
+			,#If lambda, means we must build filter using $FiledName(f: expressions ) 
+			 #Lambda field is name used in expressions (can contains /).
+				$LambdaFieldName
+		)
+		
+		$AllExpressions = @();
+		
+		$Value | %{
+			#If first value is a "and", then will prefix join with AND boolean operator! Default is or!
+			if($_[0] -eq '&'){
+				$ItemOp = 'and'
+			} else {
+				$ItemOp = 'or'
+			}
+			
+			$ItemValue = $_  -replace '^&','' -replace '^\\\&','&';
+			
+			#If a array field name was passed, then we will build with f/FieldName
+			#f will be from the array lambda expression!
+			if($LambdaFieldName){
+				$ExprFieldName = "f/$LambdaFieldName"
+			} else {
+				$ExprFieldName = $FieldName;
+			}
+			
+			#All expressions here!
+			$FullExpr = @();
+			
+			#Check if starts with...
+			$IsSW = $false;
+			$IsEW = $false;
+			
+			#Check if is starts..
+			if( $ItemValue[0] -eq '^' ){
+				$IsSW = $true;
+			}
+			$ItemValue = $ItemValue  -replace '^\^','' -replace '^\\\^','^';
+			
+			#Check if is ends..
+			if($ItemValue -match '[^\\]\$$'){
+				$IsEW = $true;
+				$ItemValue = $ItemValue  -replace  '([^\\])\$$','$1'
+			} else {
+				#Escapes \$..
+				$ItemValue = $ItemValue  -replace '\\\$$','$';
+			}
+			
+			
+			if($IsSW){
+				$FullExpr += "startswith($ExprFieldName,'$ItemValue')";
+			}
+			
+			#Endwith function... (syntax: VALUE$, escape: VALUE\$)
+			if($IsEW){
+				$FullExpr += "endswith($ExprFieldName,'$ItemValue')";
+			}
+			
+			#If not advanced expression, then just a simple equals operator!
+			if(!$FullExpr){
+				$FullExpr = "$ExprFieldName eq '$ItemValue'";
+			}
+			
+			#If have something on expression list, add with boolean operator
+			#We will join after...
+			if($AllExpressions){
+				$AllExpressions += " $ItemOp ";
+			}
+		
+			#Build final expression.
+			$Expr = $FullExpr -Join " and ";
+			
+			if($LambdaFieldName){
+				$AllExpressions += "$FieldName(f: ($expr))"
+			} else {
+				$AllExpressions += "($expr)"
+			}
+			
+			
+		}
+			
+		return $AllExpressions -Join "";
+	}
 	
 	Function Movidesk_CallUrl {
 		[CmdLetBinding()]
@@ -345,11 +494,22 @@ if($ResetStorage){
 			
 			#Specify same set of aceptable parameters
 			,$FilterCustom = $null
+			,[switch]$OnlyFilterCustom 
 			
 			,$top = $null
 			
 			,$tags = @()
 			
+			
+			,#Custom field filter
+				#Specify in format: @{ f = FiledId, r = ruleID; value = filtervalue; items = ItemsFilter  }
+					$CustomFields = @()
+			
+			,#Logical operator to be used when multiple onditions in CustomFields
+				[ValidateSet("or","and")]
+				$OpCustomFields = "and"
+				
+					
 			
 			,#get actions
 				[switch]$IncludeActions
@@ -371,7 +531,7 @@ if($ResetStorage){
 			DoRequest 	= $true
 			endpoint	= 'tickets'
 			select		= $select
-			expand		= 'createdBy,owner,clients'
+			expand		= 'createdBy,owner,clients,customFieldValues,customFieldValues($expand=items)'
 		}
 		
 		if($IncludeActions){
@@ -453,9 +613,88 @@ if($ResetStorage){
 			$AllFilter += "($TagsFilter)";
 		}	
 
+		if($CustomFields){
+			$CustomFieldsFilters = @();
+			$CustomFields | %{
+			
+						$FieldID 	= $_.f;
+						$RuleId 	= $_.r;
+						$Value			= $_.value;
+						$ValueStart		= $_.ValueStart;
+						$ValueEnd		= $_.ValueEnd;
+						$items			= $_.items;
+						$ItemOp			= $_.ItemsOp;
+						
+						#Convert to datetime formats!
+						if($Value -is [datetime]){
+							$Value = Movidesk_Datetime2StringTime $Value;
+						}
+						
+						if($ValueStart -is [datetime]){
+							$ValueStart = Movidesk_Datetime2StringTime $ValueStart;
+						}
+						
+						if($ValueEnd -is [datetime]){
+							$ValueEnd = Movidesk_Datetime2StringTime $ValueEnd;
+						}
+
+						$FieldFilters = @(
+							"cf/customFieldId eq $FieldID"
+							"cf/customFieldRuleId eq $RuleId"
+						)
+						
+						if($Value){
+							#Build
+							#
+							#	( (cf/value eq Value1) or (repeat for Value2) or (repeat for Value3))
+							#
+							$ValueFilter = Movidesk_BuildExpressionFilter -FieldName "cf/value" -Value $Value
+							$FieldFilters += "($ValueFilter)"
+						}
+						
+						if($ValueStart){
+							$FieldFilters +=  "(cf/value gt '$ValueStart')"
+						}
+						
+						if($ValueEnd){
+							$FieldFilters +=  "(cf/value le '$ValueEnd')"
+						}
+						
+						#Build the items filter!
+						#We ill build a expression joined by or:
+						#
+						#		(cf/items/ItemFunc(i: i/customFieldItem eq Value1) or (repeat for Value2) or (repeat for Value3))
+						#						
+						#
+						if($items){
+							$ItemFunc 		= $_.ItemsFunc;
+							if(!$ItemFunc){ $ItemFunc = 'any' };
+							
+							$ItemsFilter = Movidesk_BuildExpressionFilter -FieldName "cf/items/$ItemFunc" -Value $items -LambdaFieldName customFieldItem
+								
+							$FieldFilters += "($ItemsFilter)"
+						}
+
+						#Generate filter between fields...
+						$FieldFilters = $FieldFilters -Join " and ";
+						$CustomFieldsFilters += "customFieldValues/any(cf: $FieldFilters)"
+				}
+				
+			$CustomFieldsFilters = $CustomFieldsFilters -Join " $OpCustomFields ";
+			$AllFilter += "($CustomFieldsFilters)"
+		}
 
 
 		###gather all flters!
+		if($FilterCustom){
+			if($OnlyFilterCustom){
+				$AllFilter = $FilterCustom;
+			} else {
+				$AllFilter += $FilterCustom;
+			}
+			
+		}
+
 		if($AllFilter){
 			$Params['filter'] = $AllFilter -Join " and ";
 		} else {
@@ -464,6 +703,7 @@ if($ResetStorage){
 				return;
 			}
 		}
+		
 		
 		$r = New-MovideskRequest @Params;
 		
@@ -530,6 +770,8 @@ if($ResetStorage){
 			
 			
 			,$top = $null
+			
+
 				
 			,[switch]
 				$Force
@@ -563,12 +805,12 @@ if($ResetStorage){
 		}
 		
 		if($Name){
-			$NameFilter = @($Name | %{"startswith(businessName,'$_')"}) -Join " or ";
+			$NameFilter = Movidesk_BuildExpressionFilter -FieldName 'businessName' -Value $Name;
 			$AllFilter  += "($NameFilter)";
 		}
 		
 		if($Email){
-			$EmailFilter = @($Email | %{"Emails/any(e: e/email eq '$_')"}) -Join " or ";
+			$EmailFilter = Movidesk_BuildExpressionFilter -FieldName 'Emails/any' -Value $Email -LambdaFieldName 'email';
 			$AllFilter  += "($EmailFilter)";
 		}
 		
@@ -599,10 +841,13 @@ if($ResetStorage){
 			$AllFilter += "($TeamsFilter)"
 		}
 		
+
+		
 		if($AllFilter){
 			$Params['filter'] = $AllFilter -Join " and ";
 		}
 		
+
 			
 		$r = New-MovideskRequest @Params;
 		
@@ -630,8 +875,151 @@ if($ResetStorage){
 		
 		return $r;
 	}
+	
+	<#
+	Function Get-MovideskActivity {
+		[CmdLetBinding()]
+		param()
+		
+		$Params = @{
+			DoRequest 	= $true
+			endpoint	= 'activity'
+			select		= 'id'
+			#expand		= 'activityDto,teams'
+		}
+
+			
+		$r = New-MovideskRequest @Params;
+		
+		return $r;
+	}
+	#>
 
 	Function New-MovideskTicket {
+		[CmdletBinding()]
+		param(
+			$TicketData
+			
+			#Some shortcuts! (This overwrte ticket data)
+			,$createdBy	= $null
+			,$team 		= $null
+			,[string[]]$tags	= @()
+			
+			,$client		= $null
+			
+			#Will be the first action description!
+			,$subject 		= $null
+			,$description 	= $null
+			
+			#Custom fields (can be created with New-MovideskCustomField)
+			,$CustomFields = $Null
+			
+			,[switch]$ReturnParams
+		)
+		
+		$Params = @{
+			DoRequest 	= $true
+			data		= $null
+			method		= 'POST'
+			endpoint	= 'tickets'
+		}
+		
+		$Errors = @()
+		
+		if(!$TicketData){
+			$TicketData  = @{};
+		}	
+		
+		#Priorities values...
+		if($createdBy){
+			$TicketData.createdBy = @{
+				id = $createdBy.id
+			}
+		}
+		
+		if($team){
+			$TicketData.ownerTeam = $team
+		}
+
+		if($tags){
+			$TicketData.tags = $tags
+		}
+		
+		if($client){
+			[hashtable[]]$AllClients = @($client | %{
+				@{id = $_.id};
+			})
+			
+			$TicketData.clients = $AllClients;
+		}
+		
+		if($subject){
+			$TicketData.subject = $subject;
+		}
+		
+		#Validate mandatory fields...
+		if( !$TicketData.type ){
+			$TicketData.type = 2;
+		}
+		
+		#Validate mandatory fields...
+		if( !$TicketData.subject ){
+			$Errors += "Subject empty!"
+		}
+
+			
+		#Validate mandatory fields...
+		if( !$TicketData.createdBy ){
+			$Errors += "Subject empty!"
+		}
+		
+		#Validate mandatory fields...
+		if( !$TicketData.clients ){
+			$Errors += "Ticket client empty"
+		}
+		
+		if($CustomFields){
+			$ticketData.customFieldValues = @($CustomFields);
+		}
+				
+		if($description){
+			$NewAction = New-MovideskTicketAction -description $description -createdBy $createdBy -type $TicketData.type
+			$TicketData['actions'] = @($NewAction);
+		} else {
+			$Errors += "Ticket description empty"
+		}
+		
+		#Custom field validation!
+		if($TicketData.customFieldValues){
+			$i = 0;
+			$TicketData.customFieldValues | %{
+				$i++;
+				if(!$_.customFieldId -or !$_.customFieldRuleId){
+					$Errors += "field id or field rule id not set on custom field $i"
+				}
+				
+				if(!$_.line){
+					$_.line = 1;
+				}
+				
+				if($_.value -is [datetime]){
+					$_.value = Movidesk_Datetime2StringTime $_.value;
+				}
+			}
+		}
+		
+		$Params['data'] = $TicketData;
+		
+		if($Errors){
+			$AllErrors = $Errors -Join "`r`n";
+			throw "MOVIDESK_NEWTICK_FAILED:`r`n$AllErrors"
+		} elseif($ReturnParams) {
+			return $Params;
+		} else {
+			New-MovideskRequest @Params;
+		}
+		
+		
 		
 	}
 
@@ -750,7 +1138,55 @@ if($ResetStorage){
 		return $ActionsParams;
 	}
 
-	
+	#Creates a new action on some ticket!
+	Function New-MovideskCustomField {
+		[CmdletBinding()]
+		param(
+			 $FieldId
+			,$RuleId
+			,$Value
+			,$HashTable
+			,$Line 					= 1
+			,[switch]$TimeValue		
+		)
+		
+		if(!$FieldId){
+			throw "NEW_CUSTOMFIELD_INVALID_FIELDID"
+		}
+		
+		if(!$RuleId){
+			throw "NEW_CUSTOMFIELD_INVALID_RULEID"
+		}
+		
+		$f = @{
+			customFieldId 		= $FieldId
+			customFieldRuleId	= $RuleId
+			Line				= $Line
+		}
+		
+		if($Value -is [object[]]){
+			$items = @($Value | %{
+					@{ customFieldItem = [string]$_ };
+				})
+			
+			$f['items'] = [object[]]$items;
+		} else {
+			
+			if($Value -is [datetime]){
+				if($TimeValue){
+					$Value = [datetime]$TimeValue.toString("1991-01-01 HH:mm:ss")
+				}
+				
+				$Value = Movidesk_Datetime2StringTime $Value;
+			}
+			
+			$f['value'] = $Value;
+		}
+		
+		return $f;
+		
+	}
+
 # Facilities!	
 
 #Build request parameters to be used Movidesk_CallUrl
