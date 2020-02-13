@@ -23,6 +23,10 @@ if($ResetStorage){
 					
 					}
 					
+				CUSTOM_FIELDS_ALIAS = @{
+						
+					}
+					
 					
 				DEFAULT_SESSION = $null
 			}			
@@ -238,6 +242,194 @@ if($ResetStorage){
 		return $AllExpressions -Join "";
 	}
 	
+	#Build a custom field expression filter'
+	Function Movidesk_BuildCustomFieldFilter {
+		param($CustomFields, $CustomFieldName = 'customFieldValues')
+		
+		if($CustomFields){
+			$CustomFieldsFilters = @();
+			$CustomFields | %{
+						$FieldAlias	 	= $_.name;
+						$FieldID 		= $_.f;
+						$RuleId 		= $_.r;
+						
+						
+						if($FieldAlias){
+							$AliasSlot = Get-MovideskCustomFieldAlias $FieldAlias -Expected
+							$FieldID 		= $AliasSlot.customFieldId;
+							$RuleId 		= $AliasSlot.customFieldRuleId;
+						}
+						
+						
+						$Value			= $_.value;
+						$ValueStart		= $_.ValueStart;
+						$ValueEnd		= $_.ValueEnd;
+						$items			= $_.items;
+						$ItemOp			= $_.ItemsOp;
+						
+						#Convert to datetime formats!
+						if($Value -is [datetime]){
+							$Value = Movidesk_Datetime2StringTime $Value;
+						}
+						
+						if($ValueStart -is [datetime]){
+							$ValueStart = Movidesk_Datetime2StringTime $ValueStart;
+						}
+						
+						if($ValueEnd -is [datetime]){
+							$ValueEnd = Movidesk_Datetime2StringTime $ValueEnd;
+						}
+
+						$FieldFilters = @(
+							"cf/customFieldId eq $FieldID"
+							"cf/customFieldRuleId eq $RuleId"
+						)
+						
+						if($Value){
+							#Build
+							#
+							#	( (cf/value eq Value1) or (repeat for Value2) or (repeat for Value3))
+							#
+							$ValueFilter = Movidesk_BuildExpressionFilter -FieldName "cf/value" -Value $Value
+							$FieldFilters += "($ValueFilter)"
+						}
+						
+						if($ValueStart){
+							$FieldFilters +=  "(cf/value gt '$ValueStart')"
+						}
+						
+						if($ValueEnd){
+							$FieldFilters +=  "(cf/value le '$ValueEnd')"
+						}
+						
+						#Build the items filter!
+						#We ill build a expression joined by or:
+						#
+						#		(cf/items/ItemFunc(i: i/customFieldItem eq Value1) or (repeat for Value2) or (repeat for Value3))
+						#						
+						#
+						if($items){
+							$ItemFunc 		= $_.ItemsFunc;
+							if(!$ItemFunc){ $ItemFunc = 'any' };
+							
+							$ItemsFilter = Movidesk_BuildExpressionFilter -FieldName "cf/items/$ItemFunc" -Value $items -LambdaFieldName customFieldItem
+								
+							$FieldFilters += "($ItemsFilter)"
+						}
+
+						#Generate filter between fields...
+						$FieldFilters = $FieldFilters -Join " and ";
+						$CustomFieldsFilters += "$CustomFieldName/any(cf: $FieldFilters)"
+				}
+				
+			$CustomFieldsFilters = $CustomFieldsFilters -Join " $OpCustomFields ";
+			return "($CustomFieldsFilters)"
+		}
+
+	}
+	
+	
+	#add properties to a object based on custom field 
+	#Person cache is a optionally cache of eprson to be used efficiently as a query of expand person items!
+	#It is hashtable indexes by person id. Each key contains a object representing the person;
+	#THe properties we need in this oject is id and businessName.
+	#If you want show more than businessName original value, generated objects with them!
+	Function Movidesk_MapProperty2CustomField {
+		[CmdletBinding()]
+		param($o, $CustomFieldMap, $PersonCache = $null, [switch]$Force, [switch]$GetPersonCache)
+		
+		if($GetPersonCache){
+			$AllP = Get-MovideskPerson -select id,businessName -expand '';
+			$pc = @{};
+			$AllP | %{  $pc[$_.id] = $_ };
+			return $Pc;
+		}
+		
+		if($PersonCache -is [hashtable]){
+			$LocalPersonCache = $PersonCache;
+		} else {
+			$LocalPersonCache = @{};
+		}
+		
+
+		
+		if($CustomFieldMap){
+			$TargetObject = $o;
+			
+			
+			@($CustomFieldMap) | %{
+				if($_ -is [hashtable]){
+					$PropName 		= $_.prop;
+					$FieldAlias	 	= $_.name;
+					$FieldId		= $_.f;
+					$RuleId			= $_.r;
+				} else {
+					$PropName 		= [string]$_;
+					$FieldAlias	 	= [string]$_;
+				}
+
+			
+				if($FieldAlias){
+					$AliasSlot 	= Get-MovideskCustomFieldAlias $FieldAlias -Expected
+					$FieldID 	= $AliasSlot.customFieldId;
+					$RuleId 	= $AliasSlot.customFieldRuleId;
+				}
+				
+				if(!$PropName){
+					throw "MOVIDESK_FIELDPROP_EMPTYPROP";
+				}
+				
+				if($TargetObject.customFieldValues){
+					$TheField = $TargetObject.customFieldValues | ? { $_.customFieldId -eq $FieldID -and $_.customFieldRuleId -eq $RuleId };
+					
+					if($TheField){
+						
+						#Get all data!
+						
+						$PropValue	 = @($TheField | %{
+											if($_.Value){ $_.Value }
+											if($_.items){ 
+												$_.items | %{ 
+													if($_.personId){
+														if($LocalPersonCache.Contains($_.personId)){
+															$ThePerson = $LocalPersonCache[$_.personId];
+														} else {
+															#Get from server...
+															$ThePerson = Get-MovideskPerson -Id $_.personId -select id,businessName -expand '';
+															$LocalPersonCache[$_.personId] = $ThePerson;
+														}
+														
+														return $ThePerson.businessName;
+													} 
+													elseif ($_.fileName){
+														return $_.fileName
+													}
+													else {
+														return $_.customFieldItem 
+													}	
+												}
+											}
+									}|?{$_})
+									
+						if($PropValue.count -eq 1){
+							$PropValue = $PropValue[0];
+						}						
+						
+					} else {
+						$PropValue = $null;
+					}
+					
+				} else {
+					$PropValue = $null
+				}
+				
+				$TargetObject | Add-Member -Name $PropName -Type Noteproperty -Value $PropValue -Force:$ForceAdd;
+			}
+		}
+	}
+	
+
+
 	Function Movidesk_CallUrl {
 		[CmdLetBinding()]
 		param(
@@ -464,6 +656,7 @@ if($ResetStorage){
 		$formatter.Deserialize($memStream)
 	}
 	
+	
 
 	
 ## API Implentantions
@@ -502,13 +695,15 @@ if($ResetStorage){
 			
 			
 			,#Custom field filter
-				#Specify in format: @{ f = FiledId, r = ruleID; value = filtervalue; items = ItemsFilter  }
+				#Specify in format: @{ name= Alias|f = FiledId, r = ruleID; value = filtervalue; items = ItemsFilter  }
 					$CustomFields = @()
 			
 			,#Logical operator to be used when multiple onditions in CustomFields
 				[ValidateSet("or","and")]
 				$OpCustomFields = "and"
 				
+			,#Map fields to properties!
+				$FieldProperty	= $null
 					
 			
 			,#get actions
@@ -614,76 +809,11 @@ if($ResetStorage){
 		}	
 
 		if($CustomFields){
-			$CustomFieldsFilters = @();
-			$CustomFields | %{
-			
-						$FieldID 	= $_.f;
-						$RuleId 	= $_.r;
-						$Value			= $_.value;
-						$ValueStart		= $_.ValueStart;
-						$ValueEnd		= $_.ValueEnd;
-						$items			= $_.items;
-						$ItemOp			= $_.ItemsOp;
-						
-						#Convert to datetime formats!
-						if($Value -is [datetime]){
-							$Value = Movidesk_Datetime2StringTime $Value;
-						}
-						
-						if($ValueStart -is [datetime]){
-							$ValueStart = Movidesk_Datetime2StringTime $ValueStart;
-						}
-						
-						if($ValueEnd -is [datetime]){
-							$ValueEnd = Movidesk_Datetime2StringTime $ValueEnd;
-						}
-
-						$FieldFilters = @(
-							"cf/customFieldId eq $FieldID"
-							"cf/customFieldRuleId eq $RuleId"
-						)
-						
-						if($Value){
-							#Build
-							#
-							#	( (cf/value eq Value1) or (repeat for Value2) or (repeat for Value3))
-							#
-							$ValueFilter = Movidesk_BuildExpressionFilter -FieldName "cf/value" -Value $Value
-							$FieldFilters += "($ValueFilter)"
-						}
-						
-						if($ValueStart){
-							$FieldFilters +=  "(cf/value gt '$ValueStart')"
-						}
-						
-						if($ValueEnd){
-							$FieldFilters +=  "(cf/value le '$ValueEnd')"
-						}
-						
-						#Build the items filter!
-						#We ill build a expression joined by or:
-						#
-						#		(cf/items/ItemFunc(i: i/customFieldItem eq Value1) or (repeat for Value2) or (repeat for Value3))
-						#						
-						#
-						if($items){
-							$ItemFunc 		= $_.ItemsFunc;
-							if(!$ItemFunc){ $ItemFunc = 'any' };
-							
-							$ItemsFilter = Movidesk_BuildExpressionFilter -FieldName "cf/items/$ItemFunc" -Value $items -LambdaFieldName customFieldItem
-								
-							$FieldFilters += "($ItemsFilter)"
-						}
-
-						#Generate filter between fields...
-						$FieldFilters = $FieldFilters -Join " and ";
-						$CustomFieldsFilters += "customFieldValues/any(cf: $FieldFilters)"
-				}
-				
-			$CustomFieldsFilters = $CustomFieldsFilters -Join " $OpCustomFields ";
-			$AllFilter += "($CustomFieldsFilters)"
+			$CustomFields = Movidesk_BuildCustomFieldFilter $CustomFields;
+			if($CustomFields){
+				$AllFilter += $CustomFields;
+			}
 		}
-
 
 		###gather all flters!
 		if($FilterCustom){
@@ -699,7 +829,7 @@ if($ResetStorage){
 			$Params['filter'] = $AllFilter -Join " and ";
 		} else {
 			if(!$Force){
-				write-host "You dont specify no filter. Use -Force to ack this.";
+				throw "You dont specify no filter. Use -Force to ack this.";
 				return;
 			}
 		}
@@ -711,6 +841,7 @@ if($ResetStorage){
 			return $r;
 		}
 		
+		$PersonCache = $null;
 		if($r){
 			$r | %{
 				if($_.createdDate){
@@ -730,6 +861,15 @@ if($ResetStorage){
 					
 					$_ | Add-Member -Type Noteproperty -Name ClientsNames -Value $ClientList;
 				}
+				
+				if($FieldProperty){
+					#Field property was passed build a person cache...
+					if(!$PersonCache){
+						$PersonCache = Movidesk_MapProperty2CustomField -GetPersonCache
+					}
+					Movidesk_MapProperty2CustomField $_ $FieldProperty -PersonCache $PersonCache
+				}
+				
 			}
 			return $r;
 		}
@@ -762,9 +902,21 @@ if($ResetStorage){
 				$Teams
 				
 			,[string[]]$select = "id,personType,profileType,businessName,corporateName,userName,emails"
-			,$expand = 'emails'
+			,$expand = 'emails,customFieldValues,customFieldValues($expand=items)'
+			,[string[]]$IncludeSelect = @()
 			
+			,#Custom field filter
+				#Specify in format: @{ f = FiledId, r = ruleID; value = filtervalue; items = ItemsFilter  }
+					$CustomFields = @()
 			
+			,#Logical operator to be used when multiple onditions in CustomFields
+				[ValidateSet("or","and")]
+				$OpCustomFields = "and"
+				
+			,#Map fields to properties!
+				$FieldProperty	= $null
+				
+				
 			#Specify same set of aceptable parameters
 			,$FilterCustom = $null
 			
@@ -791,6 +943,20 @@ if($ResetStorage){
 			1 	= 'Pessoa'
 			2	= 'Empresa'
 			3	= 'Departamento'
+		}
+		
+		$PROFILE_TYPES = @{
+			1 	= 'Agente'
+			2	= 'Cliente'
+			3	= 'AgentClient'
+		}
+		
+		
+		
+		if($IncludeSelect){
+			$SelectList 	= @($select);
+			$SelectList		+= @($IncludeSelect | ? {  $select -NotContains $_  })
+			$Params['select'] = $SelectList
 		}
 		
 		if($top -is [int]){
@@ -841,6 +1007,15 @@ if($ResetStorage){
 			$AllFilter += "($TeamsFilter)"
 		}
 		
+		
+		if($CustomFields){
+			$CustomFields = Movidesk_BuildCustomFieldFilter $CustomFields;
+			if($CustomFields){
+				$AllFilter += $CustomFields;
+			}
+		}
+
+		
 
 		
 		if($AllFilter){
@@ -855,9 +1030,8 @@ if($ResetStorage){
 			return $r;
 		}
 		
-		
 
-		
+		$PersonCache = $null;
 		$r | %{
 			if($_.personType){
 				$_ | Add-Member -Type Noteproperty -Name personTypeDesc  -Value ($PERSON_TYPES[$_.personType])
@@ -868,8 +1042,17 @@ if($ResetStorage){
 				$_ | Add-Member -Type Noteproperty -Name email -Value $defaultEmail.email;
 			}
 			
-			
+			if($_.profileType){
+				$_ | Add-Member -Type Noteproperty -Name profileTypeDesc  -Value ($PROFILE_TYPES[$_.profileType])
+			}
 
+			if($FieldProperty){
+				#Field property was passed build a person cache...
+				if(!$PersonCache){
+					$PersonCache = Movidesk_MapProperty2CustomField -GetPersonCache
+				}
+				Movidesk_MapProperty2CustomField $_ $FieldProperty -PersonCache $PersonCache
+			}
 		}	
 		
 		
@@ -941,9 +1124,7 @@ if($ResetStorage){
 			$TicketData.ownerTeam = $team
 		}
 
-		if($tags){
-			$TicketData.tags = $tags
-		}
+
 		
 		if($client){
 			[hashtable[]]$AllClients = @($client | %{
@@ -978,21 +1159,45 @@ if($ResetStorage){
 			$Errors += "Ticket client empty"
 		}
 		
-		if($CustomFields){
-			$ticketData.customFieldValues = @($CustomFields);
-		}
+
 				
 		if($description){
 			$NewAction = New-MovideskTicketAction -description $description -createdBy $createdBy -type $TicketData.type
+			$OriginalActions = @($TicketData['actions']);
 			$TicketData['actions'] = @($NewAction);
+			
+			if($OriginalActions){
+				$TicketData['actions'] += $OriginalActions;
+			}
+			
 		} else {
 			$Errors += "Ticket description empty"
+		}
+		
+		if($CustomFields){
+			@($CustomFields) | %{
+			
+				if($_.name){
+					$AliasSlot = Get-MovideskCustomFieldAlias $_.name -Expected;
+					$_['customFieldId'] 		= $AliasSlot.customFieldId
+					$_['customFieldRuleId'] 	= $AliasSlot.customFieldRuleId
+					
+					if($AliasSlot.RequiredTags){
+						verbose "Adding tags to ticket creation due to required tags from custom field: $($_.name)";
+						$tags += $AliasSlot.RequiredTags | ? {   $tags -NotContains $_  }
+					}
+					
+				}
+				
+			}
+			
+			$ticketData.customFieldValues = @($CustomFields);
 		}
 		
 		#Custom field validation!
 		if($TicketData.customFieldValues){
 			$i = 0;
-			$TicketData.customFieldValues | %{
+			@($TicketData.customFieldValues)| %{
 				$i++;
 				if(!$_.customFieldId -or !$_.customFieldRuleId){
 					$Errors += "field id or field rule id not set on custom field $i"
@@ -1005,7 +1210,15 @@ if($ResetStorage){
 				if($_.value -is [datetime]){
 					$_.value = Movidesk_Datetime2StringTime $_.value;
 				}
+				
+				if($_.name){
+					$_.Remove('name');
+				}
 			}
+		}
+		
+		if($tags){
+			$TicketData.tags = $tags
 		}
 		
 		$Params['data'] = $TicketData;
@@ -1026,10 +1239,13 @@ if($ResetStorage){
 	Function Update-MovideskTicket {
 		[CmdletBinding()]
 		param(
-		
 			 $ticket 
 			 ,$NewAction
-			 ,$subject 
+			 ,$subject 	
+			 ,$ExcludeTags	= @()
+			 ,$IncludeTags	= @()
+			 ,[switch]$UseCurrentTicket 
+			 ,$CustomFields	= @()
 		)
 		
 		$Params = @{
@@ -1047,7 +1263,19 @@ if($ResetStorage){
 				id = $ticket.id
 			}
 		
-		$NewTicketUpdate = @{}
+		if($UseCurrentTicket){
+			if($Ticket -is [hashtable]){
+				$NewTicketUpdate = $Ticket
+				#$NewTicketUpdate.Remove('id');
+			} else {
+				throw "UPDATETICKET_USECURRENT_NOTHASHTABLE";
+			}
+		
+			
+		} else {
+			$NewTicketUpdate = @{}
+		}
+		
 		
 		if($NewAction){
 			$NewTicketUpdate['actions'] = [object[]]@($NewAction);
@@ -1057,6 +1285,63 @@ if($ResetStorage){
 			$NewTicketUpdate['subject'] = $subject;
 		}
 		
+		if($IncludeTags	 -or $ExcludeTags){
+		
+			#Get the tags from ticket!
+			write-verbose "Getting ticket tags for include or exclude...";
+			$CurrentTicket 	= Get-MovideskTicket -id $Ticket.id -select id,tags;
+			$CurrentTags 	= $CurrentTicket.tags;
+			
+			if($IncludeTags){
+				$CurrentTags += @($IncludeTags | ? { $CurrentTags -NotContains $_  });
+			}
+			
+			
+			$NewTicketUpdate['tags'] = [object[]]@($CurrentTags | ? { @($ExcludeTags) -NotContains $_ });
+		}
+		
+		if($CustomFields){
+			@($CustomFields) | %{
+				if($_.name){
+					$AliasSlot = Get-MovideskCustomFieldAlias $_.name -Expected;
+					$_['customFieldId'] 		= $AliasSlot.customFieldId
+					$_['customFieldRuleId'] 	= $AliasSlot.customFieldRuleId
+					
+					if($AliasSlot.RequiredTags){
+						verbose "Adding tags to ticket update due to required tags from custom field: $($_.name)";
+						$NewTicketUpdate['tags'] += [object[]]@($AliasSlot.RequiredTags | ? {   $NewTicketUpdate['tags'] -NotContains $_  })
+					}
+				
+				}
+			}
+			
+
+			
+			$NewTicketUpdate['customFieldValues'] = @($CustomFields);
+		}
+		
+		#Custom field validation!
+		if($NewTicketUpdate.customFieldValues){
+			$i = 0;
+			@($NewTicketUpdate.customFieldValues)| %{
+				$i++;
+				if(!$_.customFieldId -or !$_.customFieldRuleId){
+					$Errors += "field id or field rule id not set on custom field $i"
+				}
+				
+				if(!$_.line){
+					$_.line = 1;
+				}
+				
+				if($_.value -is [datetime]){
+					$_.value = Movidesk_Datetime2StringTime $_.value;
+				}
+				
+				if($_.name){
+					$_.Remove('name');
+				}
+			}
+		}
 		
 		$Params['data'] = $NewTicketUpdate;
 			
@@ -1138,17 +1423,24 @@ if($ResetStorage){
 		return $ActionsParams;
 	}
 
-	#Creates a new action on some ticket!
+	#Creates a new custom field!
 	Function New-MovideskCustomField {
 		[CmdletBinding()]
 		param(
-			 $FieldId
+			 $Alias
+			,$FieldId
 			,$RuleId
 			,$Value
 			,$HashTable
 			,$Line 					= 1
 			,[switch]$TimeValue		
 		)
+		
+		if($Alias){
+			$AliasSlot = Get-MovideskCustomFieldAlias $Alias -Expected;
+			$FieldID = $AliasSlot.customFieldId;
+			$RuleId = $AliasSlot.customFieldRuleId;
+		}
 		
 		if(!$FieldId){
 			throw "NEW_CUSTOMFIELD_INVALID_FIELDID"
@@ -1187,6 +1479,84 @@ if($ResetStorage){
 		
 	}
 
+	#Creates a alias (conepts only to this module)
+	#This alias is aname that other commands of this module can use to better reference custom fields!
+	Function New-MovideskCustomFieldAlias {
+		param(
+			$AliasName
+			,$FieldId 
+			,$RuleID
+			,[string[]]$RequiredTags = @()
+			,[switch]$Force
+		)
+		
+		if(!$AliasName){
+			throw "INVALID_ALIAS_NAME"
+		}
+		
+		if(!$FieldID){
+			throw "INVALID_ALIAS_ID";
+		}
+		
+		if(!$RuleID){
+			throw "INVALID_RULEID";
+		}
+		
+		
+		#Get existent..
+		$AliasSlot = $Global:PsMoviDesk_Storage.CUSTOM_FIELDS_ALIAS[$AliasName];
+		
+		if($AliasSlot){
+			if(!$Force){
+				throw "ALIAS_AREADY_EXISTS";
+			}
+			
+			$AliasSlot.customFieldId	= $FieldID
+			$AliasSlot.customFieldRuleId	= $RuleID
+			
+			if($RequiredTags){
+				$AliasSlot['RequiredTags']	+= $RequiredTags | ?{ $AliasSlot['RequiredTags'] -NotContains $_ }
+			}
+			
+		} else {
+			$Global:PsMoviDesk_Storage.CUSTOM_FIELDS_ALIAS[$AliasName] = @{
+						customFieldId 		= $FieldID
+						customFieldRuleId	= $RuleID
+						AliasName			= $AliasName
+						RequiredTags		= $RequiredTags
+				}
+		}
+		
+		
+		#
+		
+	}
+	
+	function Get-MovideskCustomFieldAlias {
+		[CmdletBinding()]
+		param($AliasName, [switch]$Expected)
+		
+		if($AliasName){
+			$res = $Global:PsMoviDesk_Storage.CUSTOM_FIELDS_ALIAS[$AliasName];
+			if(!$res -and $Expected){
+				throw "CUSTOMFIELDALIAS_NOTFOUND: $AliasName";
+			}
+			return $res;
+		} else {
+			return @($Global:PsMoviDesk_Storage.CUSTOM_FIELDS_ALIAS.Values) | %{ new-Object PsObject -Prop $_ };
+		}
+		
+		
+	}
+
+	function Remove-MovideskCustomFieldAlias {
+		[CmdletBinding()]
+		param($AliasName)
+		
+		$Global:PsMoviDesk_Storage.CUSTOM_FIELDS_ALIAS.Remove($AliasName);
+	}
+
+
 # Facilities!	
 
 #Build request parameters to be used Movidesk_CallUrl
@@ -1211,11 +1581,6 @@ Function New-MovideskRequest {
 	}
 
 	$Token 	= $Session.token;
-	$Url	= $Session.url;
-
-	if(!$url){
-		throw "INVALID_URL";
-	}
 	
 	if(!$token){
 		throw "INVALID_TOKEN";
@@ -1343,7 +1708,7 @@ Function New-MovideskSession {
 	$ExistentSession 	= Get-MovideskSession -Url $url -token $token;
 	
 	if($ExistentSession){
-		throw "SESSION_ALREADY_EXIST";
+		return $ExistentSession;
 	}
 	
 	$SessionId = BuildSessionId -url $Url -token $Token;
@@ -1385,9 +1750,7 @@ Function Get-MovideskSession {
 		return $AllSessions[$SessionID];
 	} else {
 		return $AllSessions.Values | ? { 
-					($_.token -eq $Token -or !$token)
-					-and
-					($_.url -eq $Url -or !$Url)
+					($_.token -eq $Token -or !$token) -and ($_.url -eq $Url -or !$Url)
 			}
 	}
 }
