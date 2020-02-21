@@ -1059,7 +1059,7 @@ if($ResetStorage){
 		return $r;
 	}
 	
-	<#
+	
 	Function Get-MovideskActivity {
 		[CmdLetBinding()]
 		param()
@@ -1076,7 +1076,7 @@ if($ResetStorage){
 		
 		return $r;
 	}
-	#>
+	
 
 	Function New-MovideskTicket {
 		[CmdletBinding()]
